@@ -1,5 +1,5 @@
 use proc_macro2::{Ident, TokenStream};
-use quote::{quote};
+use quote::{quote, ToTokens};
 use syn::{FnArg, GenericParam, Generics, ItemTrait, parse_macro_input, Pat, PathArguments, ReturnType, Signature, Token, TraitItem, Type, TypeParamBound, WhereClause};
 use syn::__private::Span;
 use syn::punctuated::Punctuated;
@@ -202,31 +202,59 @@ fn generate_generics(func: &Signature, generics: &Generics) -> Generics {
                 generics.where_clause.as_mut().unwrap().predicates.extend(where_clause.predicates);
             }
         } else {
-            if generics.where_clause.is_none() {
-                generics.where_clause = Some(syn::parse_quote! {
+            if rt.is_some() {
+                if generics.where_clause.is_none() {
+                    generics.where_clause = Some(syn::parse_quote! {
                 where ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(#input_types)->#rt
             });
-            } else {
-                let where_clause: WhereClause = syn::parse_quote! {
+                } else {
+                    let where_clause: WhereClause = syn::parse_quote! {
                 where ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(#input_types)->#rt
             };
-                generics.where_clause.as_mut().unwrap().predicates.extend(where_clause.predicates);
+                    generics.where_clause.as_mut().unwrap().predicates.extend(where_clause.predicates);
+                }
+            } else {
+                if generics.where_clause.is_none() {
+                    generics.where_clause = Some(syn::parse_quote! {
+                        where ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(#input_types)
+                    });
+                } else {
+                    let where_clause: WhereClause = syn::parse_quote! {
+                        where ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(#input_types)
+                    };
+                    generics.where_clause.as_mut().unwrap().predicates.extend(where_clause.predicates);
+                }
             }
         }
     } else {
         generics.params.push(GenericParam::Type(syn::parse_quote! { ______F___ }));
         generics.params.push(GenericParam::Type(syn::parse_quote! { ______Fut___ }));
-        if generics.where_clause.is_none() {
-            generics.where_clause = Some(syn::parse_quote! {
-                where ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(#input_types)->______Fut___,
-                ______Fut___: core::future::Future<Output=#rt> + 'static + core::marker::Send
-            });
+        if rt.is_some() {
+            if generics.where_clause.is_none() {
+                generics.where_clause = Some(syn::parse_quote! {
+                    where ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(#input_types)->______Fut___,
+                    ______Fut___: core::future::Future<Output=#rt> + 'static + core::marker::Send
+                });
+            } else {
+                let where_clause: WhereClause = syn::parse_quote! {
+                    where ______F___: core::marker::Send + core::marker::Sync + 'static +  Fn(#input_types)->______Fut___,
+                    ______Fut___: core::future::Future<Output=#rt> + 'static + core::marker::Send
+                };
+                generics.where_clause.as_mut().unwrap().predicates.extend(where_clause.predicates);
+            }
         } else {
-            let where_clause: WhereClause = syn::parse_quote! {
-            where ______F___: core::marker::Send + core::marker::Sync + 'static +  Fn(#input_types)->______Fut___,
-            ______Fut___: core::future::Future<Output=#rt> + 'static + core::marker::Send
-        };
-            generics.where_clause.as_mut().unwrap().predicates.extend(where_clause.predicates);
+            if generics.where_clause.is_none() {
+                generics.where_clause = Some(syn::parse_quote! {
+                    where ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(#input_types)->______Fut___,
+                    ______Fut___: core::future::Future<Output=()> + 'static + core::marker::Send
+                });
+            } else {
+                let where_clause: WhereClause = syn::parse_quote! {
+                    where ______F___: core::marker::Send + core::marker::Sync + 'static +  Fn(#input_types)->______Fut___,
+                    ______Fut___: core::future::Future<Output=()> + 'static + core::marker::Send
+                };
+                generics.where_clause.as_mut().unwrap().predicates.extend(where_clause.predicates);
+            }
         }
 
     }
@@ -429,6 +457,7 @@ fn test_impl_macro3() {
     };
     assert_eq!(result.to_string(), expected.to_string());
 }
+
 #[test]
 fn test_impl_macro4() {
     let input = syn::parse_quote! {
@@ -447,6 +476,58 @@ fn test_impl_macro4() {
         {
             fn call(&self, p1: &u32, p2: i16) -> Result<(), u32> {
                 (self)(p1, p2)
+            }
+        }
+    };
+    assert_eq!(result.to_string(), expected.to_string());
+}
+
+#[test]
+fn test_impl_macro5() {
+    let input: ItemTrait = syn::parse_quote! {
+        pub trait SampleTrait: 'static + Send + Sync {
+            fn call(&self, p1: &u32, p2: i16);
+        }
+    };
+    let result = impl_macro(input).unwrap();
+    let expected = quote! {
+        pub trait SampleTrait: 'static + Send + Sync {
+            fn call(&self, p1: &u32, p2: i16);
+        }
+        impl<______F___> SampleTrait for ______F___
+            where
+                ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(&u32, i16)
+        {
+            fn call(&self, p1: &u32, p2: i16) {
+                (self)(p1, p2)
+            }
+        }
+    };
+    assert_eq!(result.to_string(), expected.to_string());
+}
+
+#[test]
+fn test_impl_macro6() {
+    let input: ItemTrait = syn::parse_quote! {
+        pub trait SampleTrait: 'static + Send + Sync {
+            async fn call(&self, p1: &u32, p2: i16);
+        }
+    };
+    let result = impl_macro(input).unwrap();
+    let expected = quote! {
+        #[async_trait::async_trait]
+        pub trait SampleTrait: 'static + Send + Sync {
+            async fn call(&self, p1: &u32, p2: i16);
+        }
+        #[async_trait::async_trait]
+        impl<______F___,______Fut___> SampleTrait for ______F___
+            where
+                ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(&u32, i16) -> ______Fut___,
+                ______Fut___: core::future::Future<Output=() > + 'static + core::marker::Send
+        {
+            async fn call(&self, p1: &u32, p2: i16) {
+                let fut = (self)(p1, p2);
+                fut.await
             }
         }
     };
