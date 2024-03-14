@@ -1,6 +1,6 @@
 use proc_macro2::{Ident, TokenStream};
-use quote::{quote, ToTokens};
-use syn::{FnArg, GenericParam, Generics, ItemTrait, parse_macro_input, Pat, PathArguments, ReturnType, Signature, Token, TraitItem, Type, TypeParamBound, WhereClause};
+use quote::{quote};
+use syn::{FnArg, GenericParam, Generics, ItemTrait, Lifetime, parse_macro_input, Pat, PathArguments, ReturnType, Signature, Token, TraitItem, Type, TypeParamBound, WhereClause};
 use syn::__private::Span;
 use syn::punctuated::Punctuated;
 use syn::token::SelfValue;
@@ -8,10 +8,16 @@ use syn::token::SelfValue;
 #[proc_macro_attribute]
 pub fn callback_trait(_attr: proc_macro::TokenStream, item: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(item as ItemTrait);
-    impl_macro(input).unwrap_or_else(to_compile_errors).into()
+    impl_macro(input, true).unwrap_or_else(to_compile_errors).into()
 }
 
-fn impl_macro(input: ItemTrait) -> Result<TokenStream, Vec<syn::Error>> {
+#[proc_macro_attribute]
+pub fn unsafe_callback_trait(_attr: proc_macro::TokenStream, item: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(item as ItemTrait);
+    impl_macro(input, false).unwrap_or_else(to_compile_errors).into()
+}
+
+fn impl_macro(input: ItemTrait, is_safe: bool) -> Result<TokenStream, Vec<syn::Error>> {
     let name = &input.ident;
     let original_generics = &input.generics;
     let items = &input.items;
@@ -43,8 +49,8 @@ fn impl_macro(input: ItemTrait) -> Result<TokenStream, Vec<syn::Error>> {
     };
 
 
-    let func_proc = generate_func_impl(func_sign);
-    let generics = generate_generics(func_sign, original_generics);
+    let func_proc = generate_func_impl(func_sign, is_safe);
+    let generics = generate_generics(func_sign, original_generics, is_safe);
 
     let async_trait = if func_sign.asyncness.is_some() {
         quote! {#[async_trait::async_trait]}
@@ -155,7 +161,7 @@ fn get_async_trait_furture_bounds(ty: &Box<Type>) -> Option<Punctuated<TypeParam
     None
 }
 
-fn generate_generics(func: &Signature, generics: &Generics) -> Generics {
+fn generate_generics(func: &Signature, generics: &Generics, is_safe: bool) -> Generics {
     let rt = if let ReturnType::Type(_, ty) = &func.output {
         Some(ty.clone())
     } else {
@@ -176,7 +182,11 @@ fn generate_generics(func: &Signature, generics: &Generics) -> Generics {
             FnArg::Typed(v) => {
                 let mut ty = v.ty.clone();
                 if let Type::Reference(r) = ty.as_mut() {
-                    r.lifetime = None
+                    if is_safe {
+                        r.lifetime = None;
+                    } else {
+                        r.lifetime = Some(Lifetime::new("'static", Span::call_site()));
+                    }
                 }
                 ty
             }
@@ -261,7 +271,7 @@ fn generate_generics(func: &Signature, generics: &Generics) -> Generics {
     generics
 }
 
-fn generate_func_impl(func: &Signature) -> TokenStream {
+fn generate_func_impl(func: &Signature, is_safe: bool) -> TokenStream {
     let types = func.inputs.iter().filter(|item| {
         if let FnArg::Receiver(_) = item {
             false
@@ -292,11 +302,47 @@ fn generate_func_impl(func: &Signature) -> TokenStream {
         }
     }).collect::<Punctuated<&SelfValue, Token![,]>>();
 
+    let static_cast = if is_safe {
+        Vec::new()
+    } else {
+        func.inputs.iter().filter(|item| {
+            match item {
+                FnArg::Receiver(_) => {
+                    false
+                }
+                FnArg::Typed(v) => {
+                    if let Type::Reference(_) = v.ty.as_ref() {
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+        }).map(|item| {
+            match item {
+                FnArg::Typed(v) => {
+                    let ty = &v.ty;
+                    let pat = &v.pat;
+                    if let Type::Reference(mut r) = ty.as_ref().clone() {
+                        r.lifetime = Some(Lifetime::new("'static", Span::call_site()));
+                        quote! {
+                            let #pat: #r = unsafe { ::core::mem::transmute(#pat) };
+                        }
+                    } else {
+                        unreachable!()
+                    }
+                }
+                _ => unreachable!()
+            }
+        }).collect::<Vec<TokenStream>>()
+    };
+
     if func.asyncness.is_none() {
         let func_impl = if let ReturnType::Type(_, ty) = &func.output {
             if is_async_trait_impl(ty) {
                 quote! {
                     Box::pin(async move {
+                        #(#static_cast)*
                         let fut = (#receivers)(#types);
                         fut.await
                     })
@@ -316,6 +362,7 @@ fn generate_func_impl(func: &Signature) -> TokenStream {
         }
     } else {
         quote! {
+            #(#static_cast)*
             let fut = (#receivers)(#types);
             fut.await
         }
@@ -333,7 +380,7 @@ fn test_impl_macro() {
             async fn call(&self, p1: &u32, p2: i16) -> Result<(), u32>;
         }
     };
-    let result = impl_macro(input).unwrap();
+    let result = impl_macro(input, true).unwrap();
     let expected = quote! {
         #[async_trait::async_trait]
         pub trait SampleTrait: 'static + Send + Sync {
@@ -361,7 +408,7 @@ fn test_impl_macro2() {
             async fn call(&self, p1: u256, p2: u32, t: T) -> Result<u64, Error>;
         }
     };
-    let result = impl_macro(input).unwrap();
+    let result = impl_macro(input, true).unwrap();
     let expected = quote! {
         #[async_trait::async_trait]
         pub trait SampleTrait<T>: 'static + Send + Sync where T: Send {
@@ -406,7 +453,7 @@ fn test_impl_macro3() {
         }
 
     };
-    let result = impl_macro(input).unwrap();
+    let result = impl_macro(input, true).unwrap();
     let expected = quote! {
         pub trait SampleTrait: 'static + Send + Sync {
             #[must_use]
@@ -465,7 +512,7 @@ fn test_impl_macro4() {
             fn call(&self, p1: &u32, p2: i16) -> Result<(), u32>;
         }
     };
-    let result = impl_macro(input).unwrap();
+    let result = impl_macro(input, true).unwrap();
     let expected = quote! {
         pub trait SampleTrait: 'static + Send + Sync {
             fn call(&self, p1: &u32, p2: i16) -> Result<(), u32>;
@@ -489,7 +536,7 @@ fn test_impl_macro5() {
             fn call(&self, p1: &u32, p2: i16);
         }
     };
-    let result = impl_macro(input).unwrap();
+    let result = impl_macro(input, true).unwrap();
     let expected = quote! {
         pub trait SampleTrait: 'static + Send + Sync {
             fn call(&self, p1: &u32, p2: i16);
@@ -513,7 +560,7 @@ fn test_impl_macro6() {
             async fn call(&self, p1: &u32, p2: i16);
         }
     };
-    let result = impl_macro(input).unwrap();
+    let result = impl_macro(input, true).unwrap();
     let expected = quote! {
         #[async_trait::async_trait]
         pub trait SampleTrait: 'static + Send + Sync {
@@ -526,6 +573,216 @@ fn test_impl_macro6() {
                 ______Fut___: core::future::Future<Output=() > + 'static + core::marker::Send
         {
             async fn call(&self, p1: &u32, p2: i16) {
+                let fut = (self)(p1, p2);
+                fut.await
+            }
+        }
+    };
+    assert_eq!(result.to_string(), expected.to_string());
+}
+
+#[test]
+fn test_impl_macro7() {
+    let input = syn::parse_quote! {
+        pub trait SampleTrait: 'static + Send + Sync {
+            async fn call(&self, p1: &u32, p2: i16) -> Result<(), u32>;
+        }
+    };
+    let result = impl_macro(input, false).unwrap();
+    let expected = quote! {
+        #[async_trait::async_trait]
+        pub trait SampleTrait: 'static + Send + Sync {
+            async fn call(&self, p1: &u32, p2: i16) -> Result<(), u32>;
+        }
+        #[async_trait::async_trait]
+        impl<______F___, ______Fut___> SampleTrait for ______F___
+            where
+                ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(&'static u32, i16) -> ______Fut___,
+                ______Fut___: core::future::Future<Output=Result<(), u32> > + 'static + core::marker::Send
+        {
+            async fn call(&self, p1: &u32, p2: i16) -> Result<(), u32> {
+                let p1: &'static u32 = unsafe {::core::mem::transmute(p1)};
+                let fut = (self)(p1, p2);
+                fut.await
+            }
+        }
+    };
+    assert_eq!(result.to_string(), expected.to_string());
+}
+
+#[test]
+fn test_impl_macro8() {
+    let input = syn::parse_quote! {
+        pub trait SampleTrait<T>: 'static + Send + Sync where T: Send {
+            async fn call(&self, p1: u256, p2: u32, t: T) -> Result<u64, Error>;
+        }
+    };
+    let result = impl_macro(input, false).unwrap();
+    let expected = quote! {
+        #[async_trait::async_trait]
+        pub trait SampleTrait<T>: 'static + Send + Sync where T: Send {
+            async fn call(&self, p1: u256, p2: u32, t: T) -> Result<u64, Error>;
+        }
+        #[async_trait::async_trait]
+        impl<T, ______F___, ______Fut___> SampleTrait<T> for ______F___
+            where
+                T: Send,
+                ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(u256, u32, T) -> ______Fut___,
+                ______Fut___: core::future::Future<Output=Result<u64, Error> > + 'static + core::marker::Send
+        {
+            async fn call(&self, p1: u256, p2: u32, t: T) -> Result<u64, Error> {
+                let fut = (self)(p1, p2, t);
+                fut.await
+            }
+        }
+    };
+    assert_eq!(result.to_string(), expected.to_string());
+}
+
+#[test]
+fn test_impl_macro9() {
+    let input = syn::parse_quote! {
+        pub trait SampleTrait: 'static + Send + Sync {
+            #[must_use]
+            #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
+            fn call<'life0, 'async_trait>(
+                &'life0 self,
+                p1: u64,
+                p2: u32,
+            ) -> ::core::pin::Pin<
+                Box<
+                    dyn ::core::future::Future<Output = Result<u64, i32>>
+                        + ::core::marker::Send
+                        + 'async_trait,
+                >,
+            >
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait;
+        }
+
+    };
+    let result = impl_macro(input, false).unwrap();
+    let expected = quote! {
+        pub trait SampleTrait: 'static + Send + Sync {
+            #[must_use]
+            #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
+            fn call<'life0, 'async_trait>(
+                &'life0 self,
+                p1: u64,
+                p2: u32,
+            ) -> ::core::pin::Pin<
+                Box<
+                    dyn ::core::future::Future<Output = Result<u64, i32> >
+                        + ::core::marker::Send
+                        + 'async_trait,
+                >,
+            >
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait;
+        }
+
+        impl<______F___, ______Fut___> SampleTrait for ______F___
+            where
+                ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(u64, u32) -> ______Fut___,
+                ______Fut___: ::core::future::Future<Output=Result<u64, i32> > + ::core::marker::Send + 'static
+        {
+            #[must_use]
+            #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
+            fn call<'life0, 'async_trait>(
+                &'life0 self,
+                p1: u64,
+                p2: u32,
+            ) -> ::core::pin::Pin<
+                Box<
+                    dyn ::core::future::Future<Output = Result<u64, i32> >
+                        + ::core::marker::Send
+                        + 'async_trait,
+                >,
+            >
+            where
+                'life0: 'async_trait,
+                Self: 'async_trait {
+            Box::pin(async move {
+                let fut = (self)(p1, p2);
+                fut.await
+            })
+        }
+        }
+    };
+    assert_eq!(result.to_string(), expected.to_string());
+}
+
+#[test]
+fn test_impl_macro10() {
+    let input = syn::parse_quote! {
+        pub trait SampleTrait: 'static + Send + Sync {
+            fn call(&self, p1: &u32, p2: i16) -> Result<(), u32>;
+        }
+    };
+    let result = impl_macro(input, false).unwrap();
+    let expected = quote! {
+        pub trait SampleTrait: 'static + Send + Sync {
+            fn call(&self, p1: &u32, p2: i16) -> Result<(), u32>;
+        }
+        impl<______F___> SampleTrait for ______F___
+            where
+                ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(&'static u32, i16) -> Result<(), u32>
+        {
+            fn call(&self, p1: &u32, p2: i16) -> Result<(), u32> {
+                (self)(p1, p2)
+            }
+        }
+    };
+    assert_eq!(result.to_string(), expected.to_string());
+}
+
+#[test]
+fn test_impl_macro11() {
+    let input: ItemTrait = syn::parse_quote! {
+        pub trait SampleTrait: 'static + Send + Sync {
+            fn call(&self, p1: &u32, p2: i16);
+        }
+    };
+    let result = impl_macro(input, false).unwrap();
+    let expected = quote! {
+        pub trait SampleTrait: 'static + Send + Sync {
+            fn call(&self, p1: &u32, p2: i16);
+        }
+        impl<______F___> SampleTrait for ______F___
+            where
+                ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(&'static u32, i16)
+        {
+            fn call(&self, p1: &u32, p2: i16) {
+                (self)(p1, p2)
+            }
+        }
+    };
+    assert_eq!(result.to_string(), expected.to_string());
+}
+
+#[test]
+fn test_impl_macro12() {
+    let input: ItemTrait = syn::parse_quote! {
+        pub trait SampleTrait: 'static + Send + Sync {
+            async fn call(&self, p1: &u32, p2: i16);
+        }
+    };
+    let result = impl_macro(input, false).unwrap();
+    let expected = quote! {
+        #[async_trait::async_trait]
+        pub trait SampleTrait: 'static + Send + Sync {
+            async fn call(&self, p1: &u32, p2: i16);
+        }
+        #[async_trait::async_trait]
+        impl<______F___,______Fut___> SampleTrait for ______F___
+            where
+                ______F___: core::marker::Send + core::marker::Sync + 'static + Fn(&'static u32, i16) -> ______Fut___,
+                ______Fut___: core::future::Future<Output=() > + 'static + core::marker::Send
+        {
+            async fn call(&self, p1: &u32, p2: i16) {
+                let p1: &'static u32 = unsafe {::core::mem::transmute(p1)};
                 let fut = (self)(p1, p2);
                 fut.await
             }
